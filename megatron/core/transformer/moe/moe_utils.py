@@ -407,14 +407,25 @@ def sort_chunks_by_idxs(
     sorted_idxs: torch.Tensor,
     probs: Optional[torch.Tensor] = None,
     fused: bool = False,
+    compute_row_amax: bool = False,
 ):
-    """Split and sort the input tensor based on the split_sizes and sorted indices."""
+    """Split and sort the input tensor based on the split_sizes and sorted indices.
+
+    Returns:
+        Tuple of (output, permuted_probs, row_amax). ``row_amax`` is None unless
+        ``compute_row_amax`` is True (fp32 per-dst-row abs-max, shape [num_tokens]).
+    """
     if fused and probs is None:
         if not HAVE_TE or fused_sort_chunks_by_index is None:
             raise ValueError(
                 "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
             )
-        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None
+        if compute_row_amax:
+            output, row_amax = fused_sort_chunks_by_index(
+                input, split_sizes, sorted_idxs, compute_row_amax=True
+            )
+            return output, None, row_amax
+        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None, None
 
     if fused and probs is not None:
         if not HAVE_TE or fused_sort_chunks_by_index_with_probs is None:
@@ -422,7 +433,14 @@ def sort_chunks_by_idxs(
                 "fused_sort_chunks_by_index_with_probs is not available. "
                 "Please install TE >= 2.1.0."
             )
-        return fused_sort_chunks_by_index_with_probs(input, probs, split_sizes, sorted_idxs)
+        if compute_row_amax:
+            return fused_sort_chunks_by_index_with_probs(
+                input, probs, split_sizes, sorted_idxs, compute_row_amax=True
+            )
+        output, permuted_probs = fused_sort_chunks_by_index_with_probs(
+            input, probs, split_sizes, sorted_idxs
+        )
+        return output, permuted_probs, None
 
     input = torch.split(input, split_sizes.tolist(), dim=0)
     output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
@@ -431,7 +449,11 @@ def sort_chunks_by_idxs(
         permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
     else:
         permuted_probs = None
-    return output, permuted_probs
+    row_amax = None
+    if compute_row_amax:
+        # Unfused fallback: match TE fused semantics (per dst-row abs max).
+        row_amax = output.detach().abs().amax(dim=-1).to(dtype=torch.float32)
+    return output, permuted_probs, row_amax
 
 
 def group_limited_topk(

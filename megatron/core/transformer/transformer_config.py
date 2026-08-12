@@ -681,6 +681,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
+    moe_sort_chunks_compute_row_amax: bool = False
+    """If True, fuse per-token row amax into sort_chunks_by_idxs (AlltoAll permutation-2)
+    and pass the amax to experts for NVFP4 group quantize (skip K1). Requires
+    moe_permute_fusion and a TE build that exposes compute_row_amax on
+    moe_sort_chunks_by_index*."""
+
     moe_router_fusion: bool = False
     """Fuse ops in routing and aux loss calculation."""
 
@@ -1808,6 +1814,12 @@ class TransformerConfig(ModelParallelConfig):
                 or fused_unpermute is None
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
+
+        if self.moe_sort_chunks_compute_row_amax and not self.moe_permute_fusion:
+            raise ValueError(
+                "moe_sort_chunks_compute_row_amax requires moe_permute_fusion=True "
+                "(fused TE sort_chunks provides the amax path)."
+            )
 
         if self.overlap_moe_expert_parallel_comm:
             # TODO: remove this after we fix the hang issue with torch version < 2.6.0

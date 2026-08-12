@@ -236,8 +236,10 @@ class GroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        row_amax: Optional[torch.Tensor] = None,
     ):
         """Forward step of the GroupedMLP."""
+        del row_amax  # Reserved for NVFP4 skip-K1 path (TEGroupedMLP).
         assert self.config.bf16, "Currently GroupedGEMM for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -848,6 +850,7 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        row_amax: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -856,16 +859,31 @@ class TEGroupedMLP(MegatronModule):
             local experts.
             tokens_per_expert (torch.Tensor): The number of tokens per expert.
             permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
+            row_amax (torch.Tensor, optional): Prefused per-token row abs-max from
+                sort_chunks_by_idxs. When provided, TE NVFP4 group quantize can skip K1.
 
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        # Prefused row amax (from sort_chunks) is padded with activations below and
+        # handed to TE GroupedLinear fc1 for NVFP4 per-token skip-K1.
         tokens_per_expert = tokens_per_expert.tolist()
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                permuted_local_hidden_states, tokens_per_expert
-            )
+            if row_amax is not None:
+                (
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    row_amax,
+                ) = self.quantization_padding(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    row_amax=row_amax,
+                )
+            else:
+                permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
             )
@@ -881,6 +899,8 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
+            # Hidden was rescaled after amax fusion — drop stale amax.
+            row_amax = None
 
         if self.offload_expert_fc1:
             permuted_local_hidden_states = fine_grained_offloading_group_start(
@@ -888,7 +908,9 @@ class TEGroupedMLP(MegatronModule):
             )
         with get_fine_grained_offloading_context(self.offload_expert_fc1):
             fc1_output, bias_parallel = self.linear_fc1(
-                permuted_local_hidden_states, tokens_per_expert
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                input_row_amax=row_amax,
             )
         if self.offload_expert_fc1:
             fc1_output, bias_parallel = fine_grained_offloading_group_commit(
@@ -1100,8 +1122,10 @@ class SequentialMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        row_amax: Optional[torch.Tensor] = None,
     ):
         """Forward step of the SequentialMLP."""
+        del row_amax  # Reserved for NVFP4 skip-K1 path (TEGroupedMLP).
 
         if self.config.moe_apply_probs_on_input:
             assert (

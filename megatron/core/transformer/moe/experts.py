@@ -820,8 +820,8 @@ class TEGroupedMLP(MegatronModule):
 
         if self.config.fp8 or self.config.fp4:
             assert HAVE_TE, "FP8 and FP4 requires TE."
-            self.quantization_padding = Fp8Padding(self.num_local_experts)
-            self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
+            self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=128)
+            self.quantization_unpadding = Fp8Unpadding(self.num_local_experts, align_size=128)
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):

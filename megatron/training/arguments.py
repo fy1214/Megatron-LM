@@ -3297,10 +3297,10 @@ def _add_moe_args(parser):
                        help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
                        help='Fuse token rearrangement ops during token dispatching.')
-    group.add_argument('--moe-sort-chunks-compute-row-amax', action='store_true',
-                       help='Fuse per-token row amax into fused sort_chunks (requires '
-                       '--moe-permute-fusion) and pass it through Fp8Padding into TE '
-                       'GroupedLinear for NVFP4 per-token skip-K1.')
+    group.add_argument('--nvfp4-pertoken-amax-fuse', action='store_true',
+                       help='Enable the unified MoE NVFP4 per-token amax-fuse path: '
+                       'fc1 sort_chunks row amax + skip-K1 handoff and fc2 fused '
+                       'SwiGLU row amax + skip-K1 handoff.')
     # Token dropping arguments
     group.add_argument('--moe-expert-capacity-factor', type=float, default=None,
                        help='The capacity factor for each expert, None means no token will be dropped.')

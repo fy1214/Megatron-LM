@@ -681,11 +681,15 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
-    moe_sort_chunks_compute_row_amax: bool = False
-    """If True, fuse per-token row amax into sort_chunks_by_idxs (AlltoAll permutation-2)
-    and pass the amax to experts for NVFP4 group quantize (skip K1). Requires
-    moe_permute_fusion and a TE build that exposes compute_row_amax on
-    moe_sort_chunks_by_index*."""
+    nvfp4_pertoken_amax_fuse: bool = False
+    """Enable the full MoE NVFP4 per-token amax-fuse path.
+
+    This is a single user-facing switch for:
+    - fc1 upstream sort_chunks row amax production + skip-K1 handoff
+    - fc2 fused SwiGLU row amax production + skip-K1 handoff
+
+    Internally fc1 requires fused permutation support, so enabling this flag
+    auto-enables ``moe_permute_fusion`` during validation."""
 
     moe_router_fusion: bool = False
     """Fuse ops in routing and aux loss calculation."""
@@ -1815,11 +1819,27 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
 
-        if self.moe_sort_chunks_compute_row_amax and not self.moe_permute_fusion:
-            raise ValueError(
-                "moe_sort_chunks_compute_row_amax requires moe_permute_fusion=True "
-                "(fused TE sort_chunks provides the amax path)."
+        if self.nvfp4_pertoken_amax_fuse and not self.moe_permute_fusion:
+            self.moe_permute_fusion = True
+            from megatron.core.transformer.moe.moe_utils import (
+                fused_permute,
+                fused_permute_with_probs,
+                fused_sort_chunks_by_index,
+                fused_sort_chunks_by_index_with_probs,
+                fused_unpermute,
             )
+
+            if (
+                fused_permute is None
+                or fused_permute_with_probs is None
+                or fused_sort_chunks_by_index is None
+                or fused_sort_chunks_by_index_with_probs is None
+                or fused_unpermute is None
+            ):
+                raise ValueError(
+                    "nvfp4_pertoken_amax_fuse requires fused permutation support. "
+                    "Please install TE >= 2.1.0."
+                )
 
         if self.overlap_moe_expert_parallel_comm:
             # TODO: remove this after we fix the hang issue with torch version < 2.6.0

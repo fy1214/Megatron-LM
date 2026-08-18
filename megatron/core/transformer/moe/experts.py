@@ -873,9 +873,10 @@ class TEGroupedMLP(MegatronModule):
         # Prefused row amax (from sort_chunks) is padded with activations below and
         # handed to TE GroupedLinear fc1 for NVFP4 per-token skip-K1.
         tokens_per_expert = tokens_per_expert.tolist()
+        use_fc1_row_amax = self.config.nvfp4_pertoken_amax_fuse and row_amax is not None
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
-            if row_amax is not None:
+            if use_fc1_row_amax:
                 (
                     permuted_local_hidden_states,
                     tokens_per_expert,
@@ -886,6 +887,7 @@ class TEGroupedMLP(MegatronModule):
                     row_amax=row_amax,
                 )
             else:
+                row_amax = None
                 permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                     permuted_local_hidden_states, tokens_per_expert
                 )
@@ -928,8 +930,9 @@ class TEGroupedMLP(MegatronModule):
         # Prefused fc2 row amax is a forward-only quantize hint (not checkpointed).
         # CheckpointWithoutOutput must keep returning a single tensor (y).
         fc2_row_amax = None
-        use_swiglu_row_amax = (
-            bool(self.config.fp4)
+        use_fc2_row_amax = (
+            self.config.nvfp4_pertoken_amax_fuse
+            and bool(self.config.fp4)
             and os.environ.get("MEGATRON_DISABLE_FC2_ROW_AMAX", "0") != "1"
             and weighted_swiglu_row_amax_available()
             and self.config.bias_activation_fusion
@@ -948,7 +951,7 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
             elif self.config.bias_activation_fusion:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
-                    if use_swiglu_row_amax and bias_parallel is None:
+                    if use_fc2_row_amax and bias_parallel is None:
                         intermediate_parallel, amax = weighted_swiglu_with_row_amax_impl(
                             intermediate_parallel,
                             bias_parallel,

@@ -741,7 +741,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     self.sort_input_by_local_experts,
                     probs=global_probs,
                     fused=self.config.moe_permute_fusion,
-                    compute_row_amax=self.config.moe_sort_chunks_compute_row_amax,
+                    compute_row_amax=self.config.nvfp4_pertoken_amax_fuse,
                 )
                 self.input_row_amax = row_amax
 

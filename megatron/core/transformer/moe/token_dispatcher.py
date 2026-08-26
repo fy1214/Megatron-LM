@@ -142,7 +142,8 @@ class MoETokenDispatcher:
 
         Returns:
             A tuple containing the permuted tokens for experts, the number of
-            tokens per expert, and the permuted probabilities.
+            tokens per expert, the permuted probabilities, and an optional
+            per-token row amax (fp32) when fused sort amax is enabled.
         """
         raise NotImplementedError("dispatch_postprocess function not implemented.")
 
@@ -307,7 +308,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             self.local_map.T.contiguous()
         )
         self.routing_map = None
-        return permuted_local_hidden_states, tokens_per_expert, self.local_probs
+        return permuted_local_hidden_states, tokens_per_expert, self.local_probs, None
 
     def combine_preprocess(self, hidden_states):
         """
@@ -686,7 +687,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             global_probs (torch.Tensor): Probabilities after All-to-All.
 
         Returns:
-            A tuple of processed tokens, token counts per expert, and processed probabilities.
+            A tuple of processed tokens, token counts per expert, processed
+            probabilities, and optional per-token row amax.
         """
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
@@ -707,6 +709,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_2", self.tokens_per_expert
         )
+        self.input_row_amax = None
         if self.num_local_experts > 1:
             if self.drop_and_pad:
                 global_input_tokens = (
@@ -732,19 +735,21 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     .flatten(start_dim=0, end_dim=2)
                 )
             else:
-                global_input_tokens, global_probs = sort_chunks_by_idxs(
+                global_input_tokens, global_probs, row_amax = sort_chunks_by_idxs(
                     global_input_tokens,
                     self.num_global_tokens_per_local_expert.ravel(),
                     self.sort_input_by_local_experts,
                     probs=global_probs,
                     fused=self.config.moe_permute_fusion,
+                    compute_row_amax=self.config.nvfp4_pertoken_amax_fuse,
                 )
+                self.input_row_amax = row_amax
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_finish", self.tokens_per_expert
         )
         self.tokens_per_expert = None
-        return global_input_tokens, tokens_per_expert, global_probs
+        return global_input_tokens, tokens_per_expert, global_probs, self.input_row_amax
 
     def combine_preprocess(self, hidden_states):
         """Prepares hidden states for token combination after expert computations.
@@ -767,7 +772,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     .flatten(start_dim=0, end_dim=2)
                 )
             else:
-                hidden_states, _ = sort_chunks_by_idxs(
+                hidden_states, _, _ = sort_chunks_by_idxs(
                     hidden_states,
                     self.num_global_tokens_per_local_expert.T.ravel(),
                     self.restore_output_by_local_experts,
@@ -1476,7 +1481,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
-        return global_input_tokens, tokens_per_expert, permuted_probs
+        return global_input_tokens, tokens_per_expert, permuted_probs, None
 
     def combine_preprocess(self, hidden_states: torch.Tensor):
         """Pre-processes hidden states before combining them after expert processing.

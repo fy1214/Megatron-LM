@@ -19,8 +19,8 @@ from tests.unit_tests.test_utilities import Utils
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
     hidden_states, probs = token_dispatcher.dispatch_preprocess(hidden_states, indices, probs)
     hidden_states, probs = token_dispatcher.token_dispatch(hidden_states, probs)
-    hidden_states, tokens_per_expert, permuted_probs = token_dispatcher.dispatch_postprocess(
-        hidden_states, probs
+    hidden_states, tokens_per_expert, permuted_probs, _row_amax = (
+        token_dispatcher.dispatch_postprocess(hidden_states, probs)
     )
     return hidden_states, tokens_per_expert, permuted_probs
 

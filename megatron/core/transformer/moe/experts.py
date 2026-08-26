@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+import os
 from copy import deepcopy
 from functools import partial
 from math import ceil
@@ -22,7 +23,11 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    weighted_bias_swiglu_impl,
+    weighted_swiglu_row_amax_available,
+    weighted_swiglu_with_row_amax_impl,
+)
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -236,8 +241,10 @@ class GroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        row_amax: Optional[torch.Tensor] = None,
     ):
         """Forward step of the GroupedMLP."""
+        del row_amax  # Reserved for NVFP4 skip-K1 path (TEGroupedMLP).
         assert self.config.bf16, "Currently GroupedGEMM for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -848,6 +855,7 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        row_amax: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -856,16 +864,33 @@ class TEGroupedMLP(MegatronModule):
             local experts.
             tokens_per_expert (torch.Tensor): The number of tokens per expert.
             permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
+            row_amax (torch.Tensor, optional): Prefused per-token row abs-max from
+                sort_chunks_by_idxs. When provided, TE NVFP4 group quantize can skip K1.
 
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        # Prefused row amax (from sort_chunks) is padded with activations below and
+        # handed to TE GroupedLinear fc1 for NVFP4 per-token skip-K1.
         tokens_per_expert = tokens_per_expert.tolist()
+        use_fc1_row_amax = self.config.nvfp4_pertoken_amax_fuse and row_amax is not None
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                permuted_local_hidden_states, tokens_per_expert
-            )
+            if use_fc1_row_amax:
+                (
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    row_amax,
+                ) = self.quantization_padding(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    row_amax=row_amax,
+                )
+            else:
+                row_amax = None
+                permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
             )
@@ -881,6 +906,8 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
+            # Hidden was rescaled after amax fusion — drop stale amax.
+            row_amax = None
 
         if self.offload_expert_fc1:
             permuted_local_hidden_states = fine_grained_offloading_group_start(
@@ -888,7 +915,9 @@ class TEGroupedMLP(MegatronModule):
             )
         with get_fine_grained_offloading_context(self.offload_expert_fc1):
             fc1_output, bias_parallel = self.linear_fc1(
-                permuted_local_hidden_states, tokens_per_expert
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                input_row_amax=row_amax,
             )
         if self.offload_expert_fc1:
             fc1_output, bias_parallel = fine_grained_offloading_group_commit(
@@ -897,6 +926,19 @@ class TEGroupedMLP(MegatronModule):
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
             )
+
+        # Prefused fc2 row amax is a forward-only quantize hint (not checkpointed).
+        # CheckpointWithoutOutput must keep returning a single tensor (y).
+        fc2_row_amax = None
+        use_fc2_row_amax = (
+            self.config.nvfp4_pertoken_amax_fuse
+            and bool(self.config.fp4)
+            and os.environ.get("MEGATRON_DISABLE_FC2_ROW_AMAX", "0") != "1"
+            and weighted_swiglu_row_amax_available()
+            and self.config.bias_activation_fusion
+            and self.activation_func == F.silu
+            and self.config.gated_linear_unit
+        )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.use_te_activation_func:
@@ -909,13 +951,23 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
             elif self.config.bias_activation_fusion:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
-                    # dtype is handled inside the fused kernel
-                    intermediate_parallel = weighted_bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        permuted_probs,
-                        self.config.activation_func_fp8_input_store,
-                    )
+                    if use_fc2_row_amax and bias_parallel is None:
+                        intermediate_parallel, amax = weighted_swiglu_with_row_amax_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            permuted_probs,
+                            self.config.activation_func_fp8_input_store,
+                        )
+                        nonlocal fc2_row_amax
+                        fc2_row_amax = amax.detach()
+                    else:
+                        # dtype is handled inside the fused kernel
+                        intermediate_parallel = weighted_bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            permuted_probs,
+                            self.config.activation_func_fp8_input_store,
+                        )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
                         intermediate_parallel,
@@ -969,7 +1021,9 @@ class TEGroupedMLP(MegatronModule):
             with get_fine_grained_offloading_context(self.offload_moe_act):
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
-        output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
+        output, output_bias = self.linear_fc2(
+            bias_act_output, tokens_per_expert, input_row_amax=fc2_row_amax
+        )
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         if self.offload_moe_act:
@@ -1100,8 +1154,10 @@ class SequentialMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        row_amax: Optional[torch.Tensor] = None,
     ):
         """Forward step of the SequentialMLP."""
+        del row_amax  # Reserved for NVFP4 skip-K1 path (TEGroupedMLP).
 
         if self.config.moe_apply_probs_on_input:
             assert (

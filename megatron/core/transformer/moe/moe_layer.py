@@ -248,10 +248,12 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
-        dispatched_input, tokens_per_expert, permuted_probs = (
+        dispatched_input, tokens_per_expert, permuted_probs, row_amax = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+        expert_output, mlp_bias = self.experts(
+            dispatched_input, tokens_per_expert, permuted_probs, row_amax=row_amax
+        )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 

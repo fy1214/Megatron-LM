@@ -1413,13 +1413,30 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
 
-        def forward(self, x, m_splits):
-            """Forward."""
+        def forward(self, x, m_splits, input_row_amax=None):
+            """Forward.
+
+            Args:
+                input_row_amax: Optional contiguous fp32 per-token row amax
+                    ``(sum_M,)``, aligned with ``x`` after MoE FP8/FP4 padding.
+                    When set, TE NVFP4 per-token group quantize may skip K1.
+            """
             _is_first_microbatch = (
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
 
-            out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+            # Prefer TE builds that accept input_row_amax; older / custom
+            # GroupedLinear bases ignore the prefused amax.
+            fwd = super().forward
+            if input_row_amax is not None and "input_row_amax" in inspect.signature(fwd).parameters:
+                out = fwd(
+                    x,
+                    m_splits,
+                    is_first_microbatch=_is_first_microbatch,
+                    input_row_amax=input_row_amax,
+                )
+            else:
+                out = fwd(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
